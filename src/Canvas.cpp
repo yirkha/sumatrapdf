@@ -225,7 +225,11 @@ static void StartMouseDrag(MainWindow* win, int x, int y, bool right = false) {
     win->dragRightClick = right;
     win->dragPrevPos = Point(x, y);
     if (GetCursor()) {
-        SetCursor(gCursorDrag);
+        if (!win->annotationBeingResized) {
+            SetCursor(gCursorDrag);
+        } else {
+            SetCursorCached(IDC_SIZENWSE);
+        }
     }
 }
 
@@ -264,6 +268,40 @@ static bool StopDraggingAnnotation(MainWindow* win, int x, int y, bool aborted) 
     return true;
 }
 
+// return true if this was annotation resizing
+static bool StopResizingAnnotation(MainWindow* win, int x, int y, bool aborted) {
+    Annotation* annot = win->annotationBeingResized;
+    if (!annot) {
+        return false;
+    }
+    Size prevSize{win->dragPrevPos.x + win->annotationBeingMovedOffset.x - win->annotationBeingResizedPosition.x,
+                  win->dragPrevPos.y + win->annotationBeingMovedOffset.y - win->annotationBeingResizedPosition.y};
+    DrawMovePattern(win, win->annotationBeingResizedPosition, prevSize);
+
+    win->annotationBeingResized = nullptr;
+    if (aborted) {
+        return true;
+    }
+
+    DisplayModel* dm = win->AsFixed();
+    x += win->annotationBeingMovedOffset.x;
+    y += win->annotationBeingMovedOffset.y;
+    Point pt{x, y};
+    int pageNo = dm->GetPageNoByPoint(pt);
+    // we can only resize annotation within the same page
+    if (pageNo == PageNo(annot)) {
+        PointF bottomRight = dm->CvtFromScreen(pt, pageNo);
+        RectF r = GetRect(annot);
+        r.dx = std::max(bottomRight.x - r.x, 10.0f);
+        r.dy = std::max(bottomRight.y - r.y, 10.0f);
+        SetRect(annot, r);
+        NotifyAnnotationsChanged(win->CurrentTab()->editAnnotsWindow);
+        MainWindowRerender(win);
+        ToolbarUpdateStateForWindow(win, true);
+    }
+    return true;
+}
+
 static void StopMouseDrag(MainWindow* win, int x, int y, bool aborted) {
     if (GetCapture() != win->hwndCanvas) {
         return;
@@ -275,6 +313,9 @@ static void StopMouseDrag(MainWindow* win, int x, int y, bool aborted) {
     ReleaseCapture();
 
     if (StopDraggingAnnotation(win, x, y, aborted)) {
+        return;
+    }
+    if (StopResizingAnnotation(win, x, y, aborted)) {
         return;
     }
 
@@ -293,6 +334,7 @@ void CancelDrag(MainWindow* win) {
     win->mouseAction = MouseAction::None;
     win->linkOnLastButtonDown = nullptr;
     win->annotationBeingDragged = nullptr;
+    win->annotationBeingResized = nullptr;
     SetCursorCached(IDC_ARROW);
 }
 
@@ -416,9 +458,19 @@ static void OnMouseMove(MainWindow* win, int x, int y, WPARAM) {
                 Size size = win->annotationBeingMovedSize;
                 DrawMovePattern(win, prevPos, size);
                 DrawMovePattern(win, pos, size);
-            } else {
-                win->MoveDocBy(win->dragPrevPos.x - x, win->dragPrevPos.y - y);
+                break;
             }
+            annot = win->annotationBeingResized;
+            if (annot) {
+                Size size{prevPos.x + win->annotationBeingMovedOffset.x - win->annotationBeingResizedPosition.x,
+                          prevPos.y + win->annotationBeingMovedOffset.y - win->annotationBeingResizedPosition.y};
+                DrawMovePattern(win, win->annotationBeingResizedPosition, size);
+                size = {pos.x + win->annotationBeingMovedOffset.x - win->annotationBeingResizedPosition.x,
+                        pos.y + win->annotationBeingMovedOffset.y - win->annotationBeingResizedPosition.y};
+                DrawMovePattern(win, win->annotationBeingResizedPosition, size);
+                break;
+            }
+            win->MoveDocBy(win->dragPrevPos.x - x, win->dragPrevPos.y - y);
             break;
         }
     }
@@ -442,6 +494,26 @@ static void StartAnnotationDrag(MainWindow* win, Annotation* annot, Point& pt) {
     win->annotationBeingMovedOffset = Point{offsetX, offsetY};
     DrawMovePattern(win, pt, win->annotationBeingMovedSize);
     return;
+}
+
+static void StartAnnotationResize(MainWindow* win, Annotation* annot, Point& pt) {
+    win->annotationBeingResized = annot;
+    DisplayModel* dm = win->AsFixed();
+    CreateMovePatternLazy(win);
+    RectF r = GetRect(annot);
+    int pageNo = dm->GetPageNoByPoint(pt);
+    Rect rScreen = dm->CvtToScreen(pageNo, r);
+    win->annotationBeingResizedPosition = {rScreen.x, rScreen.y};
+    int offsetX = rScreen.x + rScreen.dx - pt.x;
+    int offsetY = rScreen.y + rScreen.dy - pt.y;
+    win->annotationBeingMovedOffset = Point{offsetX, offsetY};
+    DrawMovePattern(win, rScreen.TL(), rScreen.Size());
+    return;
+}
+
+static bool IsAnnotationNearResizeCorner(Point pt, Annotation* annot, DisplayModel* dm) {
+    Point bottomRight = dm->CvtToScreen(annot->pageNo, annot->bounds.BR());
+    return !IsDragDistance(pt.x, bottomRight.x, pt.y, bottomRight.y);
 }
 
 static void OnMouseLeftButtonDown(MainWindow* win, int x, int y, WPARAM key) {
@@ -474,7 +546,11 @@ static void OnMouseLeftButtonDown(MainWindow* win, int x, int y, WPARAM key) {
     Annotation* annot = dm->GetAnnotationAtPos(pt, tab->selectedAnnotation);
     bool isMoveableAnnot = annot && (annot == tab->selectedAnnotation) && IsMoveableAnnotation(annot->type);
     if (isMoveableAnnot) {
-        StartAnnotationDrag(win, annot, pt);
+        if (IsAnnotationNearResizeCorner(pt, annot, dm)) {
+            StartAnnotationResize(win, annot, pt);
+        } else {
+            StartAnnotationDrag(win, annot, pt);
+        }
     } else {
         ReportIf(win->linkOnLastButtonDown);
         IPageElement* pageEl = dm->GetElementAtPos(pt, nullptr);
@@ -1127,7 +1203,11 @@ static LRESULT OnSetCursorMouseNone(MainWindow* win, HWND hwnd) {
     Annotation* selected = win->CurrentTab()->selectedAnnotation;
     Annotation* annot = dm->GetAnnotationAtPos(pt, selected);
     if (annot && (annot == selected) && IsMoveableAnnotation(annot->type)) {
-        SetCursorCached(IDC_HAND);
+        if (IsAnnotationNearResizeCorner(pt, annot, dm)) {
+            SetCursorCached(IDC_SIZENWSE);
+        } else {
+            SetCursorCached(IDC_HAND);
+        }
         return TRUE;
     }
 
@@ -1167,7 +1247,11 @@ static LRESULT OnSetCursor(MainWindow* win, HWND hwnd) {
 
     switch (win->mouseAction) {
         case MouseAction::Dragging:
-            SetCursor(gCursorDrag);
+            if (!win->annotationBeingResized) {
+                SetCursor(gCursorDrag);
+            } else {
+                SetCursorCached(IDC_SIZENWSE);
+            }
             return TRUE;
         case MouseAction::Scrolling:
             SetCursorCached(IDC_SIZEALL);

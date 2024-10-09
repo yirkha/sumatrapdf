@@ -168,6 +168,8 @@ struct MainWindow {
     HBITMAP bmpMovePattern = nullptr;
     HBRUSH brMovePattern = nullptr;
     Annotation* annotationBeingDragged = nullptr;
+    Point annotationBeingResizedPosition;
+    Annotation* annotationBeingResized = nullptr;
 
     /* when moving the document by smooth scrolling, this keeps track of
        the speed at which we should scroll, which depends on the distance
